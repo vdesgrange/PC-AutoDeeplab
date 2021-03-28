@@ -18,8 +18,8 @@ class AutoDeeplab(nn.Module):
         self._num_channel = num_channel
         self._criterion = criterion
         self._crop_size = crop_size
-        self._arch_param_names = ["alphas_cell", "alphas_network"]
-        self._initialize_alphas()
+        self._arch_param_names = ["alphas", "betas"]  # ["alphas_cell", "alphas_network"]
+        self._initialize_alphas_betas()
         self.stem0 = nn.Sequential(  # Go from 3 channels images to 64 channels used in step structure
             nn.Conv2d(3, 64, 3, stride=2, padding=1),
             nn.BatchNorm2d(64),
@@ -30,7 +30,7 @@ class AutoDeeplab(nn.Module):
             nn.BatchNorm2d(64),
             nn.ReLU()
         )
-        self.stem2 = nn.Sequential( # Second operation reducing spatial resolution by factor of 2
+        self.stem2 = nn.Sequential(  # Second operation reducing spatial resolution by factor of 2
             nn.Conv2d(64, 128, 3, stride=2, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU()
@@ -165,37 +165,39 @@ class AutoDeeplab(nn.Module):
         )
 
     def forward(self, x):
-        # Indeed we might need to get rid of these lists, which, in the end, are not fully used
+        # Important : no need to store all data in these lists, in the end the algorithm only use 2 latest items.
         self.level_4 = []  # Downsample by factor 4
         self.level_8 = []  # Downsample by factor 8
         self.level_16 = []  # Downsample by factor 16
         self.level_32 = []  # Downsample by factor 32
 
         # self._init_level_arr (x)
+        # Initialisation of first stem layer downsample by 4.
         temp = self.stem0(x)  # 3 to 64 channels
-        temp = self.stem1(temp) # Spacial resolution reduction by factor 2. Downsample 2
+        temp = self.stem1(temp)  # Spacial resolution reduction by factor 2. Downsample 2
         self.level_4.append(self.stem2(temp))  # Spacial resolution reduction by factor 2. Downsample 4
 
-        weight_cells = F.softmax(self.alphas_cell, dim=-1)  # normalization
-        weight_network = F.softmax(self.alphas_network, dim=-1) # normalization
+        weight_cells = F.softmax(self.alphas, dim=-1)  # normalized alphas (cell)
+        weight_network = F.softmax(self.betas, dim=-1)  # normalized beta (outer network)
         count = 0
-        weight_network = F.softmax(self.alphas_network, dim=-1)  # normalization
-        weight_cells = F.softmax(self.alphas_cell, dim=-1)  # normalization
 
-        # Go through each possible stem layers of the network level search space.
+        # Compute each possible stem layers of the network level search space.
         # See Figure 1 from AutoDeepLab paper arXiv:1901.02985v2
-        for layer in range(self._num_layers): # For each layer of network level search space
+        for layer in range(self._num_layers):  # For each layer of network level search space
             if layer == 0:  # First layer: with reduction factor 4, 8;
                 # No cell l-2 for levels 4 and 8. Only level 4 usable for level 8.
                 # Can only use original layer 0 downsample by factor 4. L4-1.
                 # weight_cells refer to Alpha (cf. paper)
-                level4_new = self.cells[count](None, self.level_4[-1], weight_cells) # No downsample, from L4
+                level4_new = self.cells[count](None, self.level_4[-1], weight_cells)  # No downsample, from L4
                 count += 1
                 level8_new = self.cells[count](None, self.level_4[-1], weight_cells)  # Downsample, from L4
                 count += 1
-                # alphas_network refer to scalar Beta (cf. paper) from each node of previous layer.
-                self.level_4.append(level4_new * self.alphas_network[layer][0][0])
-                self.level_8.append(level8_new * self.alphas_network[layer][0][1])
+                # Beta (cf. paper) from each node of previous layer, control outer network.
+                self.level_4.append(level4_new * self.betas[layer][0][0]) # 2 items
+                self.level_8.append(level8_new * self.betas[layer][0][1]) # 1 item
+
+                # No unused stem layers
+
             elif layer == 1:  # Second layer: with reduction factor 4, 8, 16;
                 # No cell l-2 for levels 8 and 16. Only level 8 usable for level 16.
                 # No downsample, from L4-2 and L4-1 cells
@@ -204,9 +206,7 @@ class AutoDeeplab(nn.Module):
                 # No downsample, from L4-2 and L8-1 cells
                 level4_new_2 = self.cells[count](self.level_4[-2], self.level_8[-1], weight_cells)
                 count += 1
-
-                level4_new = self.alphas_network[layer][0][0] * level4_new_1 + self.alphas_network[layer][0][
-                    1] * level4_new_2
+                level4_new = self.betas[layer][0][0] * level4_new_1 + self.betas[layer][0][1] * level4_new_2
 
                 # Downsample, from L4-1
                 level8_new_1 = self.cells[count](None, self.level_4[-1], weight_cells)
@@ -214,59 +214,65 @@ class AutoDeeplab(nn.Module):
                 # No downsample, from L8-1
                 level8_new_2 = self.cells[count](None, self.level_8[-1], weight_cells)
                 count += 1
-                level8_new = self.alphas_network[layer][1][0] * level8_new_1 + self.alphas_network[layer][1][
-                    1] * level8_new_2
+                level8_new = self.betas[layer][1][0] * level8_new_1 + self.betas[layer][1][1] * level8_new_2
 
                 # Downsample, from L8
                 level16_new = self.cells[count](None, self.level_8[-1], weight_cells)
-                level16_new = level16_new * self.alphas_network[layer][1][2]
+                level16_new = level16_new * self.betas[layer][1][2]
                 count += 1
 
-                self.level_4.append(level4_new)
-                self.level_8.append(level8_new)
-                self.level_16.append(level16_new)
+                # Update stem layers list with latest
+                self.level_4.append(level4_new) # 3 items
+                self.level_8.append(level8_new) # 2 items
+                self.level_16.append(level16_new) # 1 item
+
+                # Clean unused stem layer (overall list should never go beyond 3 elements, -2, -1 and new)
+                self.level_4.pop(0)
+
             elif layer == 2:  # Third layer: with reduction factor 4, 8, 16, 32;
                 # No cell l-2 for levels 16 and 32. Only level 16 usable for level 16.
                 level4_new_1 = self.cells[count](self.level_4[-2], self.level_4[-1], weight_cells)
                 count += 1
                 level4_new_2 = self.cells[count](self.level_4[-2], self.level_8[-1], weight_cells)
                 count += 1
-                level4_new = self.alphas_network[layer][0][0] * level4_new_1 + self.alphas_network[layer][0][
-                    1] * level4_new_2
+                level4_new = self.betas[layer][0][0] * level4_new_1 + self.betas[layer][0][1] * level4_new_2
 
                 level8_new_1 = self.cells[count](self.level_8[-2], self.level_4[-1], weight_cells)
                 count += 1
                 level8_new_2 = self.cells[count](self.level_8[-2], self.level_8[-1], weight_cells)
                 count += 1
-                # print (self.level_8[-1].size(),self.level_16[-1].size())
+
                 level8_new_3 = self.cells[count](self.level_8[-2], self.level_16[-1], weight_cells)
                 count += 1
-                level8_new = self.alphas_network[layer][1][0] * level8_new_1 + self.alphas_network[layer][1][
-                    1] * level8_new_2 + self.alphas_network[layer][1][2] * level8_new_3
+                level8_new = self.betas[layer][1][0] * level8_new_1 + self.betas[layer][1][1] * level8_new_2 + \
+                             self.betas[layer][1][2] * level8_new_3
 
                 level16_new_1 = self.cells[count](None, self.level_8[-1], weight_cells)
                 count += 1
                 level16_new_2 = self.cells[count](None, self.level_16[-1], weight_cells)
                 count += 1
-                level16_new = self.alphas_network[layer][2][0] * level16_new_1 + self.alphas_network[layer][2][
-                    1] * level16_new_2
+                level16_new = self.betas[layer][2][0] * level16_new_1 + self.betas[layer][2][1] * level16_new_2
 
                 level32_new = self.cells[count](None, self.level_16[-1], weight_cells)
-                level32_new = level32_new * self.alphas_network[layer][2][2]
+                level32_new = level32_new * self.betas[layer][2][2]
                 count += 1
 
-                self.level_4.append(level4_new)
-                self.level_8.append(level8_new)
-                self.level_16.append(level16_new)
-                self.level_32.append(level32_new)
+                self.level_4.append(level4_new) # 3 items
+                self.level_8.append(level8_new) # 3 items
+                self.level_16.append(level16_new) # 2 items
+                self.level_32.append(level32_new) # 1 item
+
+                # Clean unused stem layer (overall list should never go beyond 3 elements, -2, -1 and new)
+                self.level_4.pop(0) # Back to 2 items
+                self.level_8.pop(0) # Back to 2 items
+
             elif layer == 3:  # Access to all stem layers
                 # No cell l-2 for level 32.
                 level4_new_1 = self.cells[count](self.level_4[-2], self.level_4[-1], weight_cells)
                 count += 1
                 level4_new_2 = self.cells[count](self.level_4[-2], self.level_8[-1], weight_cells)
                 count += 1
-                level4_new = self.alphas_network[layer][0][0] * level4_new_1 + self.alphas_network[layer][0][
-                    1] * level4_new_2
+                level4_new = self.betas[layer][0][0] * level4_new_1 + self.betas[layer][0][1] * level4_new_2
 
                 level8_new_1 = self.cells[count](self.level_8[-2], self.level_4[-1], weight_cells)
                 count += 1
@@ -274,8 +280,8 @@ class AutoDeeplab(nn.Module):
                 count += 1
                 level8_new_3 = self.cells[count](self.level_8[-2], self.level_16[-1], weight_cells)
                 count += 1
-                level8_new = self.alphas_network[layer][1][0] * level8_new_1 + self.alphas_network[layer][1][
-                    1] * level8_new_2 + self.alphas_network[layer][1][2] * level8_new_3
+                level8_new = self.betas[layer][1][0] * level8_new_1 + self.betas[layer][1][
+                    1] * level8_new_2 + self.betas[layer][1][2] * level8_new_3
 
                 level16_new_1 = self.cells[count](self.level_16[-2], self.level_8[-1], weight_cells)
                 count += 1
@@ -283,27 +289,31 @@ class AutoDeeplab(nn.Module):
                 count += 1
                 level16_new_3 = self.cells[count](self.level_16[-2], self.level_32[-1], weight_cells)
                 count += 1
-                level16_new = self.alphas_network[layer][2][0] * level16_new_1 + self.alphas_network[layer][2][
-                    1] * level16_new_2 + self.alphas_network[layer][2][2] * level16_new_3
+                level16_new = self.betas[layer][2][0] * level16_new_1 + self.betas[layer][2][
+                    1] * level16_new_2 + self.betas[layer][2][2] * level16_new_3
 
                 level32_new_1 = self.cells[count](None, self.level_16[-1], weight_cells)
                 count += 1
                 level32_new_2 = self.cells[count](None, self.level_32[-1], weight_cells)
                 count += 1
-                level32_new = self.alphas_network[layer][3][0] * level32_new_1 + self.alphas_network[layer][3][
-                    1] * level32_new_2
+                level32_new = self.betas[layer][3][0] * level32_new_1 + self.betas[layer][3][1] * level32_new_2
 
-                self.level_4.append(level4_new)
-                self.level_8.append(level8_new)
-                self.level_16.append(level16_new)
-                self.level_32.append(level32_new)
+                self.level_4.append(level4_new)  # 3 items
+                self.level_8.append(level8_new)  # 3 items
+                self.level_16.append(level16_new)  # 3 items
+                self.level_32.append(level32_new)  # 2 items
+
+                # Clean unused stem layer (overall list should never go beyond 3 elements, -2, -1 and new)
+                self.level_4.pop(0)  # Back to 2 items
+                self.level_8.pop(0) # Back to 2 items
+                self.level_16.pop(0) # Back to 2 items
+
             else:  # Full access to cell l-2 and l1 for each level 4, 8, 16 and 32.
                 level4_new_1 = self.cells[count](self.level_4[-2], self.level_4[-1], weight_cells)
                 count += 1
                 level4_new_2 = self.cells[count](self.level_4[-2], self.level_8[-1], weight_cells)
                 count += 1
-                level4_new = self.alphas_network[layer][0][0] * level4_new_1 + self.alphas_network[layer][0][
-                    1] * level4_new_2
+                level4_new = self.betas[layer][0][0] * level4_new_1 + self.betas[layer][0][1] * level4_new_2
 
                 level8_new_1 = self.cells[count](self.level_8[-2], self.level_4[-1], weight_cells)
                 count += 1
@@ -311,8 +321,8 @@ class AutoDeeplab(nn.Module):
                 count += 1
                 level8_new_3 = self.cells[count](self.level_8[-2], self.level_16[-1], weight_cells)
                 count += 1
-                level8_new = self.alphas_network[layer][1][0] * level8_new_1 + self.alphas_network[layer][1][
-                    1] * level8_new_2 + self.alphas_network[layer][1][2] * level8_new_3
+                level8_new = self.betas[layer][1][0] * level8_new_1 + self.betas[layer][1][
+                    1] * level8_new_2 + self.betas[layer][1][2] * level8_new_3
 
                 level16_new_1 = self.cells[count](self.level_16[-2], self.level_8[-1], weight_cells)
                 count += 1
@@ -320,20 +330,25 @@ class AutoDeeplab(nn.Module):
                 count += 1
                 level16_new_3 = self.cells[count](self.level_16[-2], self.level_32[-1], weight_cells)
                 count += 1
-                level16_new = self.alphas_network[layer][2][0] * level16_new_1 + self.alphas_network[layer][2][
-                    1] * level16_new_2 + self.alphas_network[layer][2][2] * level16_new_3
+                level16_new = self.betas[layer][2][0] * level16_new_1 + self.betas[layer][2][
+                    1] * level16_new_2 + self.betas[layer][2][2] * level16_new_3
 
                 level32_new_1 = self.cells[count](self.level_32[-2], self.level_16[-1], weight_cells)
                 count += 1
                 level32_new_2 = self.cells[count](self.level_32[-2], self.level_32[-1], weight_cells)
                 count += 1
-                level32_new = self.alphas_network[layer][3][0] * level32_new_1 + self.alphas_network[layer][3][
-                    1] * level32_new_2
+                level32_new = self.betas[layer][3][0] * level32_new_1 + self.betas[layer][3][1] * level32_new_2
 
-                self.level_4.append(level4_new)
-                self.level_8.append(level8_new)
-                self.level_16.append(level16_new)
-                self.level_32.append(level32_new)
+                self.level_4.append(level4_new) # 3 items
+                self.level_8.append(level8_new) # 3 items
+                self.level_16.append(level16_new) # 3 items
+                self.level_32.append(level32_new) # 3 items
+
+                # Clean unused stem layer (overall list should never go beyond 3 elements, -2, -1 and new)
+                self.level_4.pop(0)  # Back to 2 items
+                self.level_8.pop(0) # Back to 2 items
+                self.level_16.pop(0) # Back to 2 items
+                self.level_32.pop(0) # Back to 2 items
 
         # Atrous Spatial Pyramid Pooling attached to each spatial resolution at the L-th layer.
         aspp_result_4 = self.aspp_4(self.level_4[-1])
@@ -352,22 +367,23 @@ class AutoDeeplab(nn.Module):
         sum_feature_map = aspp_result_4 + aspp_result_8 + aspp_result_16 + aspp_result_32
         return sum_feature_map
 
-    def _initialize_alphas(self):
+    def _initialize_alphas_betas(self):
         """
-        Initial scalar alphas (Beta in paper) which controls the outer network level.
+        Initial scalar Alpha and Beta which controls the outer network level.
         Alpha and Beta are sampled from a standard gaussian (normal) distribution x 0.001
         """
         k = sum(1 for i in range(self._step) for n in range(2 + i))
         num_ops = len(PRIMITIVES)
 
         # Alpha and Beta are sampled from a standard gaussian (normal) distribution x 0.001
-        alphas_cell = torch.tensor(1e-3 * torch.randn(k, num_ops).cuda(), requires_grad=True)
-        self.register_parameter(self._arch_param_names[0], nn.Parameter(alphas_cell))
+        alphas = (1e-3 * torch.randn(k, num_ops)).clone().detach().requires_grad_(True)  # alphas_cell
 
         # num_layer x num_spatial_levels x num_spatial_connections (down, level, up)
-        alphas_network = torch.tensor(1e-3 * torch.randn(self._num_layers, 4, 3).cuda(), requires_grad=True)
-        self.register_parameter(self._arch_param_names[1], nn.Parameter(alphas_network))
-        self.alphas_network_mask = torch.ones(self._num_layers, 4, 3)
+        betas = (1e-3 * torch.randn(self._num_layers, 4, 3)).clone().detach().requires_grad_(True)  # alphas_network
+
+        self.register_parameter(self._arch_param_names[0], nn.Parameter(alphas))
+        self.register_parameter(self._arch_param_names[1], nn.Parameter(betas))
+        # self.alphas_network_mask = torch.ones(self._num_layers, 4, 3) # Useless ? Not used anywhere
 
     def decode_network(self):
         """
@@ -380,7 +396,7 @@ class AutoDeeplab(nn.Module):
 
         def _parse(weight_network, layer, curr_value, curr_result, last):
             nonlocal best_result  # Variable from outer scope
-            nonlocal max_prop # Variable from outer scope
+            nonlocal max_prop  # Variable from outer scope
 
             if (layer == self._num_layers) and (max_prop < curr_value):
                 # print (curr_result)
@@ -562,18 +578,18 @@ class AutoDeeplab(nn.Module):
                     curr_value = curr_value / weight_network[layer][num][1]
                     curr_result.pop()
 
-        network_weight = F.softmax(self.alphas_network, dim=-1) * 5
+        network_weight = F.softmax(self.betas, dim=-1) * 5
         network_weight = network_weight.data.cpu().numpy()
         _parse(network_weight, 0, 1, [], 0)
         print (max_prop)
         return best_result
 
     def arch_parameters(self):
-        # Get architecture parameters ["alphas_cell", "alphas_network"]
+        # Get architecture parameters ["alphas", "betas"]
         return [param for name, param in self.named_parameters() if name in self._arch_param_names]
 
     def weight_parameters(self):
-        # Get module parameters, avoid architecture parameters: ["alphas_cell", "alphas_network"]
+        # Get module parameters, avoid architecture parameters: ["alphas", "betas"]
         return [param for name, param in self.named_parameters() if name not in self._arch_param_names]
 
     def genotype(self):
@@ -607,7 +623,7 @@ class AutoDeeplab(nn.Module):
 
         normalized_weights = F.softmax(self.alphas_cell, dim=-1).data.cpu().numpy()
         gene_cell = _parse(normalized_weights, self._step)
-        
+
         concat = range(2 + self._step - self._multiplier, self._step + 2)
         genotype = Genotype(cell=gene_cell, cell_concat=concat)
         return genotype
