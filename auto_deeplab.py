@@ -2,6 +2,7 @@ import numpy as np
 import model_search
 from genotypes import PRIMITIVES
 from genotypes import Genotype
+from decoding_formulas import Decoder
 import torch.nn.functional as F
 from operations import *
 
@@ -10,34 +11,40 @@ class AutoDeeplab(nn.Module):
     def __init__(self, num_classes, num_layers, criterion, num_channel=40, multiplier=5, step=5, crop_size=None,
                  cell=model_search.Cell):
         super(AutoDeeplab, self).__init__()
+
         self.cells = nn.ModuleList()
         self._num_layers = num_layers
         self._num_classes = num_classes
         self._step = step
-        self._multiplier = multiplier
-        self._num_channel = num_channel
+        self._block_multiplier = block_multiplier
+        self._filter_multiplier = filter_multiplier  # 8
+        # self._multiplier = multiplier
+        # self._num_channel = num_channel
+        # self._crop_size = crop_size
         self._criterion = criterion
-        self._crop_size = crop_size
         self._arch_param_names = ["alphas", "betas"]  # ["alphas_cell", "alphas_network"]
         self._initialize_alphas_betas()
+        f_initial = int(self._filter_multiplier)  # 8
+        half_f_initial = int(f_initial / 2)  # 4
+
         self.stem0 = nn.Sequential(  # Go from 3 channels images to 64 channels used in step structure. Downsample 2
-            nn.Conv2d(3, 64, 3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(3, half_f_initial * self._block_multiplier, 3, stride=2, padding=1), # 64
+            nn.BatchNorm2d(half_f_initial * self._block_multiplier), # 64
             nn.ReLU()
         )
         self.stem1 = nn.Sequential(  # Standardization
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(half_f_initial * self._block_multiplier, half_f_initial * self._block_multiplier, 3, padding=1),
+            nn.BatchNorm2d(half_f_initial * self._block_multiplier),
             nn.ReLU()
         )
         self.stem2 = nn.Sequential(  # Second operation reducing spatial resolution by factor of 2
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(half_f_initial * self._block_multiplier, f_initial * self._block_multiplier, 3, stride=2, padding=1),
+            nn.BatchNorm2d(f_initial * self._block_multiplier),
             nn.ReLU()
         )
 
-        C_prev_prev = 64
-        C_prev = 128
+        C_prev_prev = half_f_initial * self._block_multiplier # 64
+        C_prev = f_initial * self._block_multiplier # 128
         for i in range(self._num_layers):
             # def __init__(self, steps, multiplier, C_prev_prev, C_prev, C, rate) : rate = 0 , 1, 2  reduce rate
             if i == 0:
@@ -174,56 +181,100 @@ class AutoDeeplab(nn.Module):
         self.level_8 = []  # Downsample by factor 8
         self.level_16 = []  # Downsample by factor 16
         self.level_32 = []  # Downsample by factor 32
+        count = 0
 
-        # self._init_level_arr (x)
+        # === Initialisation ===
         # Initialisation of first stem layer downsample by 4.
         temp = self.stem0(x)  # 3 to 64 channels
         temp = self.stem1(temp)  # Spacial resolution reduction by factor 2. Downsample 2
         self.level_4.append(self.stem2(temp))  # Spacial resolution reduction by factor 2. Downsample 4
 
-        weight_cells = F.softmax(self.alphas, dim=-1)  # normalized alphas (cell)
+        weight_network = torch.randn(self._num_layers, 4, 3).cuda()
+
+        # === Softmax on alphas and betas ===
         # Why does NoamRosenberg implementation changed the weight of beta ?
         # Why [0][1],[0][2] and no [0][0] ?
-        weight_network = F.softmax(self.betas, dim=-1)  # normalized beta (outer network)
-        count = 0
+        if torch.cuda.device_count() > 1:
+            img_device = torch.device('cuda', x.get_device())
+            normalized_alphas = F.softmax(self.alphas.to(device=img_device), dim=-1)
 
+            for layer in range(len(self.betas)):
+                if layer == 0:
+                    weight_network[layer][0][1:] = F.softmax(self.betas[layer][0][1:].to(device=img_device), dim=-1) * (2/3)
+
+                elif layer == 1:
+                    weight_network[layer][0][1:] = F.softmax(self.betas[layer][0][1:].to(device=img_device), dim=-1) * (2/3)
+                    weight_network[layer][1] = F.softmax(self.betas[layer][1].to(device=img_device), dim=-1)
+
+                elif layer == 2:
+                    weight_network[layer][0][1:] = F.softmax(self.betas[layer][0][1:].to(device=img_device), dim=-1) * (2/3)
+                    weight_network[layer][1] = F.softmax(self.betas[layer][1].to(device=img_device), dim=-1)
+                    weight_network[layer][2] = F.softmax(self.betas[layer][2].to(device=img_device), dim=-1)
+                else:
+                    weight_network[layer][0][1:] = F.softmax(self.betas[layer][0][1:].to(device=img_device), dim=-1) * (2/3)
+                    weight_network[layer][1] = F.softmax(self.betas[layer][1].to(device=img_device), dim=-1)
+                    weight_network[layer][2] = F.softmax(self.betas[layer][2].to(device=img_device), dim=-1)
+                    weight_network[layer][3][:2] = F.softmax(self.betas[layer][3][:1].to(device=img_device), dim=-1) * (2/3)
+        else:
+            normalized_alphas = F.softmax(self.alphas, dim=-1) # normalized alphas (cell). original
+            # weight_network = F.softmax(self.betas, dim=-1)  # normalized beta (outer network)
+
+            for layer in range(len(self.betas)):
+                if layer == 0:
+                    weight_network[layer][0][1:] = F.softmax(self.betas[layer][0][1:], dim=-1) * (2/3)
+
+                elif layer == 1:
+                    weight_network[layer][0][1:] = F.softmax(self.betas[layer][0][1:], dim=-1) * (2/3)
+                    weight_network[layer][1] = F.softmax(self.betas[layer][1], dim=-1)
+
+                elif layer == 2:
+                    weight_network[layer][0][1:] = F.softmax(self.betas[layer][0][1:], dim=-1) * (2/3)
+                    weight_network[layer][1] = F.softmax(self.betas[layer][1], dim=-1)
+                    weight_network[layer][2] = F.softmax(self.betas[layer][2], dim=-1)
+                else:
+                    weight_network[layer][0][1:] = F.softmax(self.betas[layer][0][1:], dim=-1) * (2/3)
+                    weight_network[layer][1] = F.softmax(self.betas[layer][1], dim=-1)
+                    weight_network[layer][2] = F.softmax(self.betas[layer][2], dim=-1)
+                    weight_network[layer][3][:2] = F.softmax(self.betas[layer][3][:2], dim=-1) * (2/3)
+
+        # === Stem layers ===
         # Compute each possible stem layers of the network level search space.
         # See Figure 1 from AutoDeepLab paper arXiv:1901.02985v2
         for layer in range(self._num_layers):  # For each layer of network level search space
             if layer == 0:  # First layer: with reduction factor 4, 8;
                 # No cell l-2 for levels 4 and 8. Only level 4 usable for level 8.
                 # Can only use original layer 0 downsample by factor 4. L4-1.
-                # weight_cells refer to Alpha (cf. paper)
-                level4_new = self.cells[count](None, self.level_4[-1], weight_cells)  # No downsample, from L4
+                # normalized_alphas refer to Alpha (cf. paper)
+                level4_new = self.cells[count](None, self.level_4[-1], normalized_alphas)  # No downsample, from L4
                 count += 1
-                level8_new = self.cells[count](None, self.level_4[-1], weight_cells)  # Downsample, from L4
+                level8_new = self.cells[count](None, self.level_4[-1], normalized_alphas)  # Downsample, from L4
                 count += 1
                 # Beta (cf. paper) from each node of previous layer, control outer network.
-                self.level_4.append(level4_new * self.betas[layer][0][0]) # 2 items
-                self.level_8.append(level8_new * self.betas[layer][0][1]) # 1 item
+                self.level_4.append(level4_new * self.betas[layer][0][1]) # 2 items
+                self.level_8.append(level8_new * self.betas[layer][0][2]) # 1 item
 
                 # No unused stem layers
 
             elif layer == 1:  # Second layer: with reduction factor 4, 8, 16;
                 # No cell l-2 for levels 8 and 16. Only level 8 usable for level 16.
                 # No downsample, from L4-2 and L4-1 cells
-                level4_new_1 = self.cells[count](self.level_4[-2], self.level_4[-1], weight_cells)
+                level4_new_1 = self.cells[count](self.level_4[-2], self.level_4[-1], normalized_alphas)
                 count += 1
                 # No downsample, from L4-2 and L8-1 cells
-                level4_new_2 = self.cells[count](self.level_4[-2], self.level_8[-1], weight_cells)
+                level4_new_2 = self.cells[count](self.level_4[-2], self.level_8[-1], normalized_alphas)
                 count += 1
-                level4_new = self.betas[layer][0][0] * level4_new_1 + self.betas[layer][0][1] * level4_new_2
+                level4_new = self.betas[layer][0][1] * level4_new_1 + self.betas[layer][1][0] * level4_new_2
 
                 # Downsample, from L4-1
-                level8_new_1 = self.cells[count](None, self.level_4[-1], weight_cells)
+                level8_new_1 = self.cells[count](None, self.level_4[-1], normalized_alphas)
                 count += 1
                 # No downsample, from L8-1
-                level8_new_2 = self.cells[count](None, self.level_8[-1], weight_cells)
+                level8_new_2 = self.cells[count](None, self.level_8[-1], normalized_alphas)
                 count += 1
-                level8_new = self.betas[layer][1][0] * level8_new_1 + self.betas[layer][1][1] * level8_new_2
+                level8_new = self.betas[layer][0][2] * level8_new_1 + self.betas[layer][1][1] * level8_new_2
 
                 # Downsample, from L8
-                level16_new = self.cells[count](None, self.level_8[-1], weight_cells)
+                level16_new = self.cells[count](None, self.level_8[-1], normalized_alphas)
                 level16_new = level16_new * self.betas[layer][1][2]
                 count += 1
 
@@ -237,29 +288,29 @@ class AutoDeeplab(nn.Module):
 
             elif layer == 2:  # Third layer: with reduction factor 4, 8, 16, 32;
                 # No cell l-2 for levels 16 and 32. Only level 16 usable for level 16.
-                level4_new_1 = self.cells[count](self.level_4[-2], self.level_4[-1], weight_cells)
+                level4_new_1 = self.cells[count](self.level_4[-2], self.level_4[-1], normalized_alphas)
                 count += 1
-                level4_new_2 = self.cells[count](self.level_4[-2], self.level_8[-1], weight_cells)
+                level4_new_2 = self.cells[count](self.level_4[-2], self.level_8[-1], normalized_alphas)
                 count += 1
-                level4_new = self.betas[layer][0][0] * level4_new_1 + self.betas[layer][0][1] * level4_new_2
+                level4_new = self.betas[layer][0][1] * level4_new_1 + self.betas[layer][1][0] * level4_new_2
 
-                level8_new_1 = self.cells[count](self.level_8[-2], self.level_4[-1], weight_cells)
+                level8_new_1 = self.cells[count](self.level_8[-2], self.level_4[-1], normalized_alphas)
                 count += 1
-                level8_new_2 = self.cells[count](self.level_8[-2], self.level_8[-1], weight_cells)
+                level8_new_2 = self.cells[count](self.level_8[-2], self.level_8[-1], normalized_alphas)
                 count += 1
 
-                level8_new_3 = self.cells[count](self.level_8[-2], self.level_16[-1], weight_cells)
+                level8_new_3 = self.cells[count](self.level_8[-2], self.level_16[-1], normalized_alphas)
                 count += 1
-                level8_new = self.betas[layer][1][0] * level8_new_1 + self.betas[layer][1][1] * level8_new_2 + \
-                             self.betas[layer][1][2] * level8_new_3
+                level8_new = self.betas[layer][0][2] * level8_new_1 + self.betas[layer][1][1] * level8_new_2 + \
+                             self.betas[layer][2][0] * level8_new_3
 
-                level16_new_1 = self.cells[count](None, self.level_8[-1], weight_cells)
+                level16_new_1 = self.cells[count](None, self.level_8[-1], normalized_alphas)
                 count += 1
-                level16_new_2 = self.cells[count](None, self.level_16[-1], weight_cells)
+                level16_new_2 = self.cells[count](None, self.level_16[-1], normalized_alphas)
                 count += 1
-                level16_new = self.betas[layer][2][0] * level16_new_1 + self.betas[layer][2][1] * level16_new_2
+                level16_new = self.betas[layer][1][2] * level16_new_1 + self.betas[layer][2][1] * level16_new_2
 
-                level32_new = self.cells[count](None, self.level_16[-1], weight_cells)
+                level32_new = self.cells[count](None, self.level_16[-1], normalized_alphas)
                 level32_new = level32_new * self.betas[layer][2][2]
                 count += 1
 
@@ -274,35 +325,35 @@ class AutoDeeplab(nn.Module):
 
             elif layer == 3:  # Access to all stem layers
                 # No cell l-2 for level 32.
-                level4_new_1 = self.cells[count](self.level_4[-2], self.level_4[-1], weight_cells)
+                level4_new_1 = self.cells[count](self.level_4[-2], self.level_4[-1], normalized_alphas)
                 count += 1
-                level4_new_2 = self.cells[count](self.level_4[-2], self.level_8[-1], weight_cells)
+                level4_new_2 = self.cells[count](self.level_4[-2], self.level_8[-1], normalized_alphas)
                 count += 1
-                level4_new = self.betas[layer][0][0] * level4_new_1 + self.betas[layer][0][1] * level4_new_2
+                level4_new = self.betas[layer][0][1] * level4_new_1 + self.betas[layer][1][0] * level4_new_2
 
-                level8_new_1 = self.cells[count](self.level_8[-2], self.level_4[-1], weight_cells)
+                level8_new_1 = self.cells[count](self.level_8[-2], self.level_4[-1], normalized_alphas)
                 count += 1
-                level8_new_2 = self.cells[count](self.level_8[-2], self.level_8[-1], weight_cells)
+                level8_new_2 = self.cells[count](self.level_8[-2], self.level_8[-1], normalized_alphas)
                 count += 1
-                level8_new_3 = self.cells[count](self.level_8[-2], self.level_16[-1], weight_cells)
+                level8_new_3 = self.cells[count](self.level_8[-2], self.level_16[-1], normalized_alphas)
                 count += 1
-                level8_new = self.betas[layer][1][0] * level8_new_1 + self.betas[layer][1][
-                    1] * level8_new_2 + self.betas[layer][1][2] * level8_new_3
+                level8_new = self.betas[layer][0][2] * level8_new_1 + self.betas[layer][1][
+                    1] * level8_new_2 + self.betas[layer][2][0] * level8_new_3
 
-                level16_new_1 = self.cells[count](self.level_16[-2], self.level_8[-1], weight_cells)
+                level16_new_1 = self.cells[count](self.level_16[-2], self.level_8[-1], normalized_alphas)
                 count += 1
-                level16_new_2 = self.cells[count](self.level_16[-2], self.level_16[-1], weight_cells)
+                level16_new_2 = self.cells[count](self.level_16[-2], self.level_16[-1], normalized_alphas)
                 count += 1
-                level16_new_3 = self.cells[count](self.level_16[-2], self.level_32[-1], weight_cells)
+                level16_new_3 = self.cells[count](self.level_16[-2], self.level_32[-1], normalized_alphas)
                 count += 1
-                level16_new = self.betas[layer][2][0] * level16_new_1 + self.betas[layer][2][
-                    1] * level16_new_2 + self.betas[layer][2][2] * level16_new_3
+                level16_new = self.betas[layer][1][2] * level16_new_1 + self.betas[layer][2][
+                    1] * level16_new_2 + self.betas[layer][3][0] * level16_new_3
 
-                level32_new_1 = self.cells[count](None, self.level_16[-1], weight_cells)
+                level32_new_1 = self.cells[count](None, self.level_16[-1], normalized_alphas)
                 count += 1
-                level32_new_2 = self.cells[count](None, self.level_32[-1], weight_cells)
+                level32_new_2 = self.cells[count](None, self.level_32[-1], normalized_alphas)
                 count += 1
-                level32_new = self.betas[layer][3][0] * level32_new_1 + self.betas[layer][3][1] * level32_new_2
+                level32_new = self.betas[layer][2][2] * level32_new_1 + self.betas[layer][3][1] * level32_new_2
 
                 self.level_4.append(level4_new)  # 3 items
                 self.level_8.append(level8_new)  # 3 items
@@ -315,35 +366,35 @@ class AutoDeeplab(nn.Module):
                 self.level_16.pop(0) # Back to 2 items
 
             else:  # Full access to cell l-2 and l1 for each level 4, 8, 16 and 32.
-                level4_new_1 = self.cells[count](self.level_4[-2], self.level_4[-1], weight_cells)
+                level4_new_1 = self.cells[count](self.level_4[-2], self.level_4[-1], normalized_alphas)
                 count += 1
-                level4_new_2 = self.cells[count](self.level_4[-2], self.level_8[-1], weight_cells)
+                level4_new_2 = self.cells[count](self.level_4[-2], self.level_8[-1], normalized_alphas)
                 count += 1
-                level4_new = self.betas[layer][0][0] * level4_new_1 + self.betas[layer][0][1] * level4_new_2
+                level4_new = self.betas[layer][0][1] * level4_new_1 + self.betas[layer][1][0] * level4_new_2
 
-                level8_new_1 = self.cells[count](self.level_8[-2], self.level_4[-1], weight_cells)
+                level8_new_1 = self.cells[count](self.level_8[-2], self.level_4[-1], normalized_alphas)
                 count += 1
-                level8_new_2 = self.cells[count](self.level_8[-2], self.level_8[-1], weight_cells)
+                level8_new_2 = self.cells[count](self.level_8[-2], self.level_8[-1], normalized_alphas)
                 count += 1
-                level8_new_3 = self.cells[count](self.level_8[-2], self.level_16[-1], weight_cells)
+                level8_new_3 = self.cells[count](self.level_8[-2], self.level_16[-1], normalized_alphas)
                 count += 1
-                level8_new = self.betas[layer][1][0] * level8_new_1 + self.betas[layer][1][
-                    1] * level8_new_2 + self.betas[layer][1][2] * level8_new_3
+                level8_new = self.betas[layer][0][2] * level8_new_1 + self.betas[layer][1][
+                    1] * level8_new_2 + self.betas[layer][2][0] * level8_new_3
 
-                level16_new_1 = self.cells[count](self.level_16[-2], self.level_8[-1], weight_cells)
+                level16_new_1 = self.cells[count](self.level_16[-2], self.level_8[-1], normalized_alphas)
                 count += 1
-                level16_new_2 = self.cells[count](self.level_16[-2], self.level_16[-1], weight_cells)
+                level16_new_2 = self.cells[count](self.level_16[-2], self.level_16[-1], normalized_alphas)
                 count += 1
-                level16_new_3 = self.cells[count](self.level_16[-2], self.level_32[-1], weight_cells)
+                level16_new_3 = self.cells[count](self.level_16[-2], self.level_32[-1], normalized_alphas)
                 count += 1
-                level16_new = self.betas[layer][2][0] * level16_new_1 + self.betas[layer][2][
-                    1] * level16_new_2 + self.betas[layer][2][2] * level16_new_3
+                level16_new = self.betas[layer][1][2] * level16_new_1 + self.betas[layer][2][
+                    1] * level16_new_2 + self.betas[layer][3][0] * level16_new_3
 
-                level32_new_1 = self.cells[count](self.level_32[-2], self.level_16[-1], weight_cells)
+                level32_new_1 = self.cells[count](self.level_32[-2], self.level_16[-1], normalized_alphas)
                 count += 1
-                level32_new_2 = self.cells[count](self.level_32[-2], self.level_32[-1], weight_cells)
+                level32_new_2 = self.cells[count](self.level_32[-2], self.level_32[-1], normalized_alphas)
                 count += 1
-                level32_new = self.betas[layer][3][0] * level32_new_1 + self.betas[layer][3][1] * level32_new_2
+                level32_new = self.betas[layer][2][2] * level32_new_1 + self.betas[layer][3][1] * level32_new_2
 
                 self.level_4.append(level4_new) # 3 items
                 self.level_8.append(level8_new) # 3 items
@@ -363,7 +414,8 @@ class AutoDeeplab(nn.Module):
         aspp_result_32 = self.aspp_32(self.level_32[-1])
 
         # Upsampled to the original resolution ...
-        upsample = nn.Upsample(size=(self._crop_size, self._crop_size), mode='bilinear', align_corners=True)
+        upsample = nn.Upsample(size=x.size()[2:], mode='bilinear', align_corners=True)  # Is it a good idea to use x ?
+        # upsample = nn.Upsample(size=(self._crop_size, self._crop_size), mode='bilinear', align_corners=True)
         aspp_result_4 = upsample(aspp_result_4)
         aspp_result_8 = upsample(aspp_result_8)
         aspp_result_16 = upsample(aspp_result_16)
@@ -384,7 +436,7 @@ class AutoDeeplab(nn.Module):
         # Alpha and Beta are sampled from a standard gaussian (normal) distribution x 0.001
         alphas = (1e-3 * torch.randn(k, num_ops)).clone().detach().requires_grad_(True)  # alphas_cell
 
-        # num_layer x num_spatial_levels x num_spatial_connections (down, level, up)
+        # num_layer x num_spatial_levels x num_spatial_connections (up, straight, down)
         betas = (1e-3 * torch.randn(self._num_layers, 4, 3)).clone().detach().requires_grad_(True)  # alphas_network
 
         self.register_parameter(self._arch_param_names[0], nn.Parameter(alphas))
@@ -603,36 +655,8 @@ class AutoDeeplab(nn.Module):
         Decode discrete cell architecture by first retaining the 2 strongest predecessors for each block,
         and then choose the most likely operator by taking the argmax. (See paper section 4.3).
         """
-        def _parse(weights, steps):
-            """
-            Select best operation based on weights associated and generates genotype
-
-            """
-            gene = []  # Array to store cell genotypes
-            start = 0  # Initial start index
-            n = 2  # Initial end index. 2 to handle the 2 input edges coming from previous cells.
-            for i in range(steps):  # For each intermediate node
-                end = start + n
-                # Select best operation to apply. k is index of the each operation (except 'none').
-                # For each edge, get the operation with maximal weight associated.
-                get_op = lambda x: -np.max(weights[x][1:])
-                edges = sorted(range(start, end), key=get_op)
-                top_edges = edges[:2]  # Get two best edges
-
-                for j in top_edges:
-                    best_op_index = np.argmax(weights[j][1:])  # exclude none operation
-                    gene.append((PRIMITIVES[best_op_index], j))  # Add best operation TODO: Review the output formatting
-
-                start = end  # End index became start index
-                n += 1
-            return gene
-
-        normalized_weights = F.softmax(self.alphas_cell, dim=-1).data.cpu().numpy()
-        gene_cell = _parse(normalized_weights, self._step)
-
-        concat = range(2 + self._step - self._multiplier, self._step + 2)
-        genotype = Genotype(cell=gene_cell, cell_concat=concat)
-        return genotype
+        decoder = Decoder(self.alphas, self._block_multiplier, self._step)
+        return decoder.genotype_decode()
 
     def _loss(self, input, target):
         logits = self(input)  # Loss criteria to handle
