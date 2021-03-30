@@ -20,12 +20,12 @@ class AutoDeeplab(nn.Module):
         self._crop_size = crop_size
         self._arch_param_names = ["alphas", "betas"]  # ["alphas_cell", "alphas_network"]
         self._initialize_alphas_betas()
-        self.stem0 = nn.Sequential(  # Go from 3 channels images to 64 channels used in step structure
+        self.stem0 = nn.Sequential(  # Go from 3 channels images to 64 channels used in step structure. Downsample 2
             nn.Conv2d(3, 64, 3, stride=2, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU()
         )
-        self.stem1 = nn.Sequential(  # First operation reducing spatial resolution by factor of 2
+        self.stem1 = nn.Sequential(  # Standardization
             nn.Conv2d(64, 64, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU()
@@ -150,18 +150,22 @@ class AutoDeeplab(nn.Module):
                 self.cells += [cell3_3]
                 self.cells += [cell4_1]
                 self.cells += [cell4_2]
+
+        # Todo. Review ASPP implementation as suggested
         self.aspp_4 = nn.Sequential(
+            # Atrous rate = 96 / 4 = 24, as in the paper.
             ASPP(self._num_channel, 24, 24, self._num_classes)
         )
 
         self.aspp_8 = nn.Sequential(
-            ASPP(self._num_channel * 2, 12, 12, self._num_classes)
+            # Atrous rate = 96 / 8 = 12
+            ASPP(self._num_channel * 2, 12, 12, self._num_classes) # Number of filters remains = B x F x s/4
         )
         self.aspp_16 = nn.Sequential(
-            ASPP(self._num_channel * 4, 6, 6, self._num_classes)
+            ASPP(self._num_channel * 4, 6, 6, self._num_classes) # Atrous rate = 96 / 16 = 6
         )
         self.aspp_32 = nn.Sequential(
-            ASPP(self._num_channel * 8, 3, 3, self._num_classes)
+            ASPP(self._num_channel * 8, 3, 3, self._num_classes) # Atrous rate = 96 / 32 = 3
         )
 
     def forward(self, x):
@@ -178,6 +182,8 @@ class AutoDeeplab(nn.Module):
         self.level_4.append(self.stem2(temp))  # Spacial resolution reduction by factor 2. Downsample 4
 
         weight_cells = F.softmax(self.alphas, dim=-1)  # normalized alphas (cell)
+        # Why does NoamRosenberg implementation changed the weight of beta ?
+        # Why [0][1],[0][2] and no [0][0] ?
         weight_network = F.softmax(self.betas, dim=-1)  # normalized beta (outer network)
         count = 0
 
