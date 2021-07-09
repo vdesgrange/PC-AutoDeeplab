@@ -1,20 +1,34 @@
-import argparse
 import os
 import numpy as np
-from tqdm import tqdm
 import torch.nn as nn
+from tqdm import tqdm
+from collections import OrderedDict
 from mypath import Path
 from dataloaders import make_data_loader
 from modeling.sync_batchnorm.replicate import patch_replication_callback
 from modeling.deeplab import *
 from utils.loss import SegmentationLosses
-from utils.calculate_weights import calculate_weigths_labels
 from utils.lr_scheduler import LR_Scheduler
 from utils.saver import Saver
 from utils.summaries import TensorboardSummary
 from utils.metrics import Evaluator
 from auto_deeplab import AutoDeeplab
-from architect import Architect
+from config_utils.search_args import obtain_search_args
+from utils.copy_state_dict import copy_state_dict
+# import apex
+# try:
+#     from apex import amp
+#     APEX_AVAILABLE = True
+# except ModuleNotFoundError:
+#     APEX_AVAILABLE = False
+
+
+print('working with pytorch version {}'.format(torch.__version__))
+print('with cuda version {}'.format(torch.version.cuda))
+print('cudnn enabled: {}'.format(torch.backends.cudnn.enabled))
+print('cudnn version: {}'.format(torch.backends.cudnn.version()))
+
+torch.backends.cudnn.benchmark = True
 
 class Trainer(object):
     def __init__(self, args):
@@ -26,55 +40,92 @@ class Trainer(object):
         # Define Tensorboard Summary
         self.summary = TensorboardSummary(self.saver.experiment_dir)
         self.writer = self.summary.create_summary()
+        # self.use_amp = True if (APEX_AVAILABLE and args.use_amp) else False
+        self.opt_level = args.opt_level
 
-        # Define Dataloader
-        kwargs = {'num_workers': args.workers, 'pin_memory': True}
-        #self.train_loader1, self.train_loader2, self.val_loader, self.test_loader, self.nclass = make_data_loader(args, **kwargs)
-        self.train_loader1, self.train_loader2, self.val_loader,  self.nclass = make_data_loader(args, **kwargs)
-        
-        # Define Criterion
-        # whether to use class balanced weights
+        kwargs = {'num_workers': args.workers, 'pin_memory': True, 'drop_last':True}
+        self.train_loaderA, self.train_loaderB, self.val_loader, self.test_loader, self.nclass = make_data_loader(args, **kwargs)
+
         if args.use_balanced_weights:
             classes_weights_path = os.path.join(Path.db_root_dir(args.dataset), args.dataset+'_classes_weights.npy')
             if os.path.isfile(classes_weights_path):
                 weight = np.load(classes_weights_path)
             else:
-                weight = calculate_weigths_labels(args.dataset, self.train_loader, self.nclass)
+                raise NotImplementedError
+                #if so, which trainloader to use?
+                # weight = calculate_weigths_labels(args.dataset, self.train_loader, self.nclass)
             weight = torch.from_numpy(weight.astype(np.float32))
         else:
             weight = None
         self.criterion = SegmentationLosses(weight=weight, cuda=args.cuda).build_loss(mode=args.loss_type)
 
         # Define network
-        model = AutoDeeplab (self.nclass, 12, self.criterion, crop_size=self.args.crop_size)
+        model = AutoDeeplab(self.nclass, 12, self.criterion, self.args.filter_multiplier,
+                             self.args.block_multiplier, self.args.step)
         optimizer = torch.optim.SGD(
                 model.weight_parameters(),
                 args.lr,
                 momentum=args.momentum,
                 weight_decay=args.weight_decay
             )
-        self.model, self.optimizer = model, optimizer
-
-        # Using cuda
-        if args.cuda:
-            self.model = torch.nn.DataParallel(self.model, device_ids=self.args.gpu_ids)
-            patch_replication_callback(self.model)
-            self.model = self.model.cuda()
-            print ('cuda finished')
-
-
-        # Define Optimizer
-
 
         self.model, self.optimizer = model, optimizer
+
+        self.architect_optimizer = torch.optim.Adam(self.model.arch_parameters(),
+                                                    lr=args.arch_lr, betas=(0.9, 0.999),
+                                                    weight_decay=args.arch_weight_decay)
 
         # Define Evaluator
         self.evaluator = Evaluator(self.nclass)
         # Define lr scheduler
         self.scheduler = LR_Scheduler(args.lr_scheduler, args.lr,
-                                            args.epochs, len(self.train_loader1))
+                                      args.epochs, len(self.train_loaderA), min_lr=args.min_lr)
+        # TODO: Figure out if len(self.train_loader) should be devided by two ? in other module as well
+        # Using cuda
+        if args.cuda:
+            self.model = self.model.cuda()
 
-        self.architect = Architect (self.model, args)
+
+        # mixed precision
+        # if self.use_amp and args.cuda:
+        #     keep_batchnorm_fp32 = True if (self.opt_level == 'O2' or self.opt_level == 'O3') else None
+        #
+        #     # fix for current pytorch version with opt_level 'O1'
+        #     if self.opt_level == 'O1' and torch.__version__ < '1.3':
+        #         for module in self.model.modules():
+        #             if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+        #                 # Hack to fix BN fprop without affine transformation
+        #                 if module.weight is None:
+        #                     module.weight = torch.nn.Parameter(
+        #                         torch.ones(module.running_var.shape, dtype=module.running_var.dtype,
+        #                                    device=module.running_var.device), requires_grad=False)
+        #                 if module.bias is None:
+        #                     module.bias = torch.nn.Parameter(
+        #                         torch.zeros(module.running_var.shape, dtype=module.running_var.dtype,
+        #                                     device=module.running_var.device), requires_grad=False)
+        #
+        #     # print(keep_batchnorm_fp32)
+        #     self.model, [self.optimizer, self.architect_optimizer] = amp.initialize(
+        #         self.model, [self.optimizer, self.architect_optimizer], opt_level=self.opt_level,
+        #         keep_batchnorm_fp32=keep_batchnorm_fp32, loss_scale="dynamic")
+        #
+        #     print('cuda finished')
+
+
+        # Using data parallel
+        if args.cuda and len(self.args.gpu_ids) >1:
+            if self.opt_level == 'O2' or self.opt_level == 'O3':
+                print('currently cannot run with nn.DataParallel and optimization level', self.opt_level)
+            self.model = torch.nn.DataParallel(self.model, device_ids=self.args.gpu_ids)
+            patch_replication_callback(self.model)
+            print('training on multiple-GPUs')
+
+        #checkpoint = torch.load(args.resume)
+        #print('about to load state_dict')
+        #self.model.load_state_dict(checkpoint['state_dict'])
+        #print('model loaded')
+        #sys.exit()
+
         # Resuming checkpoint
         self.best_pred = 0.0
         if args.resume is not None:
@@ -82,12 +133,30 @@ class Trainer(object):
                 raise RuntimeError("=> no checkpoint found at '{}'" .format(args.resume))
             checkpoint = torch.load(args.resume)
             args.start_epoch = checkpoint['epoch']
-            if args.cuda:
+
+            # if the weights are wrapped in module object we have to clean it
+            if args.clean_module:
                 self.model.load_state_dict(checkpoint['state_dict'])
+                state_dict = checkpoint['state_dict']
+                new_state_dict = OrderedDict()
+                for k, v in state_dict.items():
+                    name = k[7:]  # remove 'module.' of dataparallel
+                    new_state_dict[name] = v
+                # self.model.load_state_dict(new_state_dict)
+                copy_state_dict(self.model.state_dict(), new_state_dict)
+
             else:
-                self.model.load_state_dict(checkpoint['state_dict'])
+                if len(self.args.gpu_ids) > 1 and (torch.cuda.device_count() > 1 or args.load_parallel):
+                    # self.model.module.load_state_dict(checkpoint['state_dict'])
+                    copy_state_dict(self.model.module.state_dict(), checkpoint['state_dict'])
+                else:
+                    # self.model.load_state_dict(checkpoint['state_dict'])
+                    copy_state_dict(self.model.state_dict(), checkpoint['state_dict'])
+
+
             if not args.ft:
-                self.optimizer.load_state_dict(checkpoint['optimizer'])
+                # self.optimizer.load_state_dict(checkpoint['optimizer'])
+                copy_state_dict(self.optimizer.state_dict(), checkpoint['optimizer'])
             self.best_pred = checkpoint['best_pred']
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
@@ -99,35 +168,49 @@ class Trainer(object):
     def training(self, epoch):
         train_loss = 0.0
         self.model.train()
-        tbar = tqdm(self.train_loader1)
-        num_img_tr = len(self.train_loader1)
+        tbar = tqdm(self.train_loaderA)
+        num_img_tr = len(self.train_loaderA)
         for i, sample in enumerate(tbar):
             image, target = sample['image'], sample['label']
-            search = next (iter (self.train_loader2))
-            image_search, target_search = search['image'], search['label']
-            # print ('------------------------begin-----------------------')
             if self.args.cuda:
                 image, target = image.cuda(), target.cuda()
-                image_search, target_search = image_search.cuda (), target_search.cuda () 
-                # print ('cuda finish')
             self.scheduler(self.optimizer, i, epoch, self.best_pred)
             self.optimizer.zero_grad()
             output = self.model(image)
-            torch.cuda.empty_cache()
             loss = self.criterion(output, target)
+            # if self.use_amp:
+            #     with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+            #         scaled_loss.backward()
+            # else:
             loss.backward()
             self.optimizer.step()
-            if epoch>19:
-                self.architect.step (image_search, target_search)
+
+            if epoch >= self.args.alpha_epoch:
+                search = next(iter(self.train_loaderB))
+                image_search, target_search = search['image'], search['label']
+                if self.args.cuda:
+                    image_search, target_search = image_search.cuda (), target_search.cuda ()
+
+                self.architect_optimizer.zero_grad()
+                output_search = self.model(image_search)
+                arch_loss = self.criterion(output_search, target_search)
+                # if self.use_amp:
+                #     with amp.scale_loss(arch_loss, self.architect_optimizer) as arch_scaled_loss:
+                #         arch_scaled_loss.backward()
+                # else:
+                arch_loss.backward()
+                self.architect_optimizer.step()
+
             train_loss += loss.item()
             tbar.set_description('Train loss: %.3f' % (train_loss / (i + 1)))
-            self.writer.add_scalar('train/total_loss_iter', loss.item(), i + num_img_tr * epoch)
+            #self.writer.add_scalar('train/total_loss_iter', loss.item(), i + num_img_tr * epoch)
 
             # Show 10 * 3 inference results each epoch
             if i % (num_img_tr // 10) == 0:
                 global_step = i + num_img_tr * epoch
                 self.summary.visualize_image(self.writer, self.args.dataset, image, target, output, global_step)
 
+            #torch.cuda.empty_cache()
         self.writer.add_scalar('train/total_loss_epoch', train_loss, epoch)
         print('[Epoch: %d, numImages: %5d]' % (epoch, i * self.args.batch_size + image.data.shape[0]))
         print('Loss: %.3f' % train_loss)
@@ -135,9 +218,13 @@ class Trainer(object):
         if self.args.no_val:
             # save checkpoint every epoch
             is_best = False
+            if torch.cuda.device_count() > 1 and len(self.args.gpu_ids) > 1:
+                state_dict = self.model.module.state_dict()
+            else:
+                state_dict = self.model.state_dict()
             self.saver.save_checkpoint({
                 'epoch': epoch + 1,
-                'state_dict': self.model.state_dict(),
+                'state_dict': state_dict,
                 'optimizer': self.optimizer.state_dict(),
                 'best_pred': self.best_pred,
             }, is_best)
@@ -148,6 +235,7 @@ class Trainer(object):
         self.evaluator.reset()
         tbar = tqdm(self.val_loader, desc='\r')
         test_loss = 0.0
+
         for i, sample in enumerate(tbar):
             image, target = sample['image'], sample['label']
             if self.args.cuda:
@@ -182,94 +270,25 @@ class Trainer(object):
         if new_pred > self.best_pred:
             is_best = True
             self.best_pred = new_pred
+            if torch.cuda.device_count() > 1:
+                state_dict = self.model.module.state_dict()
+            else:
+                state_dict = self.model.state_dict()
             self.saver.save_checkpoint({
                 'epoch': epoch + 1,
-                'state_dict': self.model.state_dict(),
+                'state_dict': state_dict,
                 'optimizer': self.optimizer.state_dict(),
                 'best_pred': self.best_pred,
             }, is_best)
 
 def main():
-    parser = argparse.ArgumentParser(description="PyTorch DeeplabV3Plus Training")
-    parser.add_argument('--backbone', type=str, default='resnet',
-                        choices=['resnet', 'xception', 'drn', 'mobilenet'],
-                        help='backbone name (default: resnet)')
-    parser.add_argument('--out_stride', type=int, default=16,
-                        help='network output stride (default: 8)')
-    parser.add_argument('--dataset', type=str, default='pascal',
-                        choices=['pascal', 'coco', 'cityscapes'],
-                        help='dataset name (default: pascal)')
-    parser.add_argument('--use_sbd', action='store_true', default=False,
-                        help='whether to use SBD dataset (default: True)')
-    parser.add_argument('--workers', type=int, default=4,
-                        metavar='N', help='dataloader threads')
-    parser.add_argument('--base_size', type=int, default=320,
-                        help='base image size')
-    parser.add_argument('--crop_size', type=int, default=320,
-                        help='crop image size')
-    parser.add_argument('--resize', type=int, default=512,
-                        help='resize image size')
-    parser.add_argument('--sync_bn', type=bool, default=None,
-                        help='whether to use sync bn (default: auto)')
-    parser.add_argument('--freeze_bn', type=bool, default=False,
-                        help='whether to freeze bn parameters (default: False)')
-    parser.add_argument('--loss_type', type=str, default='ce',
-                        choices=['ce', 'focal'],
-                        help='loss func type (default: ce)')
-    # training hyper params
-    parser.add_argument('--epochs', type=int, default=None, metavar='N',
-                        help='number of epochs to train (default: auto)')
-    parser.add_argument('--start_epoch', type=int, default=0,
-                        metavar='N', help='start epochs (default:0)')
-    parser.add_argument('--batch_size', type=int, default=None,
-                        metavar='N', help='input batch size for \
-                                training (default: auto)')
-    parser.add_argument('--test_batch_size', type=int, default=None,
-                        metavar='N', help='input batch size for \
-                                testing (default: auto)')
-    parser.add_argument('--use_balanced_weights', action='store_true', default=False,
-                        help='whether to use balanced weights (default: False)')
-    # optimizer params
-    parser.add_argument('--lr', type=float, default=0.025, metavar='LR',
-                        help='learning rate (default: auto)')
-    parser.add_argument('--arch_lr', type=float, default=3e-3, 
-                       help='learning rate for alpha and beta in architect searching process')
-
-    parser.add_argument('--lr_scheduler', type=str, default='cos',
-                        choices=['poly', 'step', 'cos'],
-                        help='lr scheduler mode: (default: cos)')
-    parser.add_argument('--momentum', type=float, default=0.9,
-                        metavar='M', help='momentum (default: 0.9)')
-    parser.add_argument('--weight_decay', type=float, default=3e-4,
-                        metavar='M', help='w-decay (default: 5e-4)')
-    parser.add_argument('--arch_weight_decay', type=float, default=1e-3,
-                        metavar='M', help='w-decay (default: 5e-4)')
-
-    parser.add_argument('--nesterov', action='store_true', default=False,
-                        help='whether use nesterov (default: False)')
-    # cuda, seed and logging
-    parser.add_argument('--no_cuda', action='store_true', default=
-                        False, help='disables CUDA training')
-    parser.add_argument('--gpu-ids', nargs='*', type=int, default=0,
-                        help='which GPU to train on (default: 0)')
-    parser.add_argument('--seed', type=int, default=1, metavar='S',
-                        help='random seed (default: 1)')
-    # checking point
-    parser.add_argument('--resume', type=str, default=None,
-                        help='put the path to resuming file if needed')
-    parser.add_argument('--checkname', type=str, default=None,
-                        help='set the checkpoint name')
-    # finetuning pre-trained models
-    parser.add_argument('--ft', action='store_true', default=False,
-                        help='finetuning on a different dataset')
-    # evaluation option
-    parser.add_argument('--eval_interval', type=int, default=1,
-                        help='evaluuation interval (default: 1)')
-    parser.add_argument('--no_val', action='store_true', default=False,
-                        help='skip validation during training')
-
-    args = parser.parse_args()
+    args = obtain_search_args()
     args.cuda = not args.no_cuda and torch.cuda.is_available()
+    if args.cuda:
+        try:
+            args.gpu_ids = [int(s) for s in args.gpu_ids.split(',')]
+        except ValueError:
+            raise ValueError('Argument --gpu_ids must be a comma-separated list of integers only')
 
     if args.sync_bn is None:
         if args.cuda and len(args.gpu_ids) > 1:
@@ -281,8 +300,9 @@ def main():
     if args.epochs is None:
         epoches = {
             'coco': 30,
-            'cityscapes': 200,
+            'cityscapes': 40,
             'pascal': 50,
+            'kd':10
         }
         args.epochs = epoches[args.dataset.lower()]
 
@@ -292,13 +312,7 @@ def main():
     if args.test_batch_size is None:
         args.test_batch_size = args.batch_size
 
-    if args.lr is None:
-        lrs = {
-            'coco': 0.1,
-            'cityscapes': 0.025,
-            'pascal': 0.007,
-        }
-        #args.lr = lrs[args.dataset.lower()] / (4 * len(args.gpu_ids)) * args.batch_size
+    #args.lr = args.lr / (4 * len(args.gpu_ids)) * args.batch_size
 
 
     if args.checkname is None:

@@ -6,8 +6,8 @@ from retrain_model.new_model import network_layer_to_space
 
 class Decoder(object):
     def __init__(self, alphas, betas, steps):
-        self._alphas = alphas
         self._betas = betas
+        self._alphas = alphas
         self._steps = steps
         self._num_layers = self._betas.shape[0]
         self.network_space = torch.zeros(12, 4, 3)
@@ -261,38 +261,23 @@ class Decoder(object):
         return best_result
 
     def genotype_decode(self):
-        """
-        Decode discrete cell architecture by first retaining the 2 strongest predecessors for each block,
-        and then choose the most likely operator by taking the argmax. (See paper section 4.3).
-        """
+
         def _parse(alphas, steps):
-            """
-            Select best operation based on weights associated and generates genotype
-            """
-            gene = [] # Array to store cell genotypes
-            start = 0 # Initial start index
-            n = 2 # Initial end index. 2 to handle the 2 input edges coming from previous cells.
-            for i in range(steps): # For each intermediate node
+            gene = []
+            start = 0
+            n = 2
+            for i in range(steps):
                 end = start + n
-                # Select best operation to apply. k is index of the each operation (except 'none').
-                # For each edge, get the operation with maximal weight associated.
-                get_op = lambda x: -np.max(alphas[x][1:])
-                edges = sorted(range(start, end), key=get_op)  # ignore none value
-                top2edges = edges[:2] # Get two best edges
-
+                edges = sorted(range(start, end), key=lambda x: -np.max(alphas[x, 1:]))  # ignore none value
+                top2edges = edges[:2]
                 for j in top2edges:
-                    best_op_index = np.argmax(alphas[j][1:])  # exclude none operation
-                    gene.append([j, best_op_index]) # Add best operation TODO: Review the output formatting
-                    # gene.append((PRIMITIVES[best_op_index], j))
-
-                start = end  # End index became start index
+                    best_op_index = np.argmax(alphas[j])  # this can include none op
+                    gene.append([j, best_op_index])
+                start = end
                 n += 1
             return np.array(gene)
 
         normalized_alphas = F.softmax(self._alphas, dim=-1).data.cpu().numpy()
         gene_cell = _parse(normalized_alphas, self._steps)
 
-        # concat = range(2 + self._step - self._multiplier, self._step + 2)
-        # genotype = Genotype(cell=gene_cell, cell_concat=concat)
-        # return genotype
         return gene_cell

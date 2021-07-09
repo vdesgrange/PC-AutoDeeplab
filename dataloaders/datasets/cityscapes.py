@@ -1,52 +1,60 @@
 import os
 import numpy as np
-import scipy.misc as m
 from PIL import Image
-from torch.utils import data
 from mypath import Path
-from torchvision import transforms
+from torch.utils import data
 from dataloaders import custom_transforms as tr
-import random
 
-def sp(args, split='train'):
-    root=Path.db_root_dir('cityscapes')
-    split="train"
-    images_base = os.path.join(root, 'leftImg8bit', split)
-    rootdir=images_base
-    suffix='.png'
-    
-    ls =   [os.path.join(looproot, filename)
-                for looproot, _, filenames in os.walk(rootdir)
-                for filename in filenames if filename.endswith(suffix)]
-    random.shuffle(ls)
-    split = 2975//2
 
-    return CityscapesSegmentation(args, split='train', part=ls[split:]), CityscapesSegmentation(args, split='train', part=ls[:split])
+def twoTrainSeg(args, root=Path.db_root_dir('cityscapes')):
+    images_base = os.path.join(root, 'leftImg8bit', 'train')
+    train_files = [os.path.join(looproot, filename) for looproot, _, filenames in os.walk(images_base)
+                   for filename in filenames if filename.endswith('.png')]
+    number_images = len(train_files)
+    permuted_indices_ls = np.random.permutation(number_images)
+    indices_1 = permuted_indices_ls[: int(0.5 * number_images) + 1]
+    indices_2 = permuted_indices_ls[int(0.5 * number_images):]
+    if len(indices_1) % 2 != 0 or len(indices_2) % 2 != 0:
+        raise Exception('indices lists need to be even numbers for batch norm')
+    return CityscapesSegmentation(args, split='train', indices_for_split=indices_1), CityscapesSegmentation(args,
+                                                                                                            split='train',
+                                                                                                            indices_for_split=indices_2)
+
 
 class CityscapesSegmentation(data.Dataset):
     NUM_CLASSES = 19
 
-    def __init__(self, args, root=Path.db_root_dir('cityscapes'), split="train", part=None):
-        self.NUM_CLASSES = 19
+    CLASSES = [
+        'road', 'sidewalk', 'building', 'wall', 'fence', 'pole', 'traffic light',
+        'traffic sign', 'vegetation', 'terrain', 'sky', 'person', 'rider', 'car',
+        'truck', 'bus', 'train', 'motorcycle', 'bicycle'
+    ]
+
+    def __init__(self, args, root=Path.db_root_dir('cityscapes'), split="train", indices_for_split=None):
         self.root = root
         self.split = split
         self.args = args
         self.files = {}
-        self.part=part
-        self.images_base = os.path.join(self.root, 'leftImg8bit', self.split)
-        self.annotations_base = os.path.join(self.root, 'gtFine', self.split)
-
-        if self.split=="train":
-            self.files[split] = part
+        self.mean = (0.485, 0.456, 0.406)
+        self.std = (0.229, 0.224, 0.225)
+        self.crop = self.args.crop_size
+        if split.startswith('re'):
+            self.images_base = os.path.join(self.root, 'leftImg8bit', self.split[2:])
+            self.annotations_base = os.path.join(self.root, 'gtFine', self.split[2:])
         else:
-            self.files[split] = self.recursive_glob(rootdir=self.images_base, suffix='.png')
-        
+            self.images_base = os.path.join(self.root, 'leftImg8bit', self.split)
+            self.annotations_base = os.path.join(self.root, 'gtFine', self.split)
+
+        self.files[split] = self.recursive_glob(rootdir=self.images_base, suffix='.png')
+
+        if indices_for_split is not None:
+            self.files[split] = np.array(self.files[split])[indices_for_split].tolist()
 
         self.void_classes = [0, 1, 2, 3, 4, 5, 6, 9, 10, 14, 15, 16, 18, 29, 30, -1]
         self.valid_classes = [7, 8, 11, 12, 13, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33]
-        self.class_names = ['unlabelled', 'road', 'sidewalk', 'building', 'wall', 'fence', \
-                            'pole', 'traffic_light', 'traffic_sign', 'vegetation', 'terrain', \
-                            'sky', 'person', 'rider', 'car', 'truck', 'bus', 'train', \
+        self.class_names = ['unlabelled', 'road', 'sidewalk', 'building', 'wall', 'fence',
+                            'pole', 'traffic_light', 'traffic_sign', 'vegetation', 'terrain',
+                            'sky', 'person', 'rider', 'car', 'truck', 'bus', 'train',
                             'motorcycle', 'bicycle']
 
         self.ignore_index = 255
@@ -56,6 +64,7 @@ class CityscapesSegmentation(data.Dataset):
             raise Exception("No files for split=[%s] found in %s" % (split, self.images_base))
 
         print("Found %d %s images" % (len(self.files[split]), split))
+        self.transform = self.get_transform()
 
     def __len__(self):
         return len(self.files[self.split])
@@ -73,13 +82,7 @@ class CityscapesSegmentation(data.Dataset):
         _target = Image.fromarray(_tmp)
 
         sample = {'image': _img, 'label': _target}
-
-        if self.split == 'train':
-            return self.transform_tr(sample)
-        elif self.split == 'val':
-            return self.transform_val(sample)
-        elif self.split == 'test':
-            return self.transform_ts(sample)
+        return self.transform(sample)
 
     def encode_segmap(self, mask):
         # Put all void classes to zero
@@ -98,87 +101,32 @@ class CityscapesSegmentation(data.Dataset):
                 for looproot, _, filenames in os.walk(rootdir)
                 for filename in filenames if filename.endswith(suffix)]
 
-    def transform_tr(self, sample):
-        composed_transforms = transforms.Compose([
-            FixedResize(resize=self.args.resize),
-            RandomCrop(crop_size=self.args.crop_size),
-            #tr.RandomGaussianBlur(),
-            tr.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            tr.ToTensor()])
+    def get_transform(self):
+        if self.split == 'train':
+            return tr.transform_tr(self.args, self.mean, self.std)
+        elif self.split == 'val':
+            return tr.transform_val(self.args, self.mean, self.std)
+        elif self.split == 'test':
+            return tr.transform_ts(self.args, self.mean, self.std)
+        elif self.split == 'retrain':
+            return tr.transform_retr(self.args, self.mean, self.std)
+        elif self.split == 'reval':
+            return tr.transform_reval(self.args, self.mean, self.std)
 
-        return composed_transforms(sample)
 
-    def transform_val(self, sample):
-
-        composed_transforms = transforms.Compose([
-            tr.FixScaleCrop(crop_size=self.args.crop_size),
-            tr.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            tr.ToTensor()])
-
-        return composed_transforms(sample)
-
-    def transform_ts(self, sample):
-
-        composed_transforms = transforms.Compose([
-            tr.FixedResize(size=self.args.crop_size),
-            tr.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            tr.ToTensor()])
-
-        return composed_transforms(sample)
-    
-    
-# resize to 512*1024    
-class FixedResize(object):
-    """change the short edge length to size"""
-    def __init__(self, resize=512):
-        self.size1 = resize  # size= 512 
-
-    def __call__(self, sample):
-        img = sample['image']
-        mask = sample['label']
-        assert img.size == mask.size
-
-        w, h = img.size
-        if w > h:
-            oh = self.size1
-            ow = int(1.0 * w * oh / h)
-        else:
-            ow = self.size1
-            oh = int(1.0 * h * ow / w)
-        img = img.resize((ow,oh), Image.BILINEAR)
-        mask = mask.resize((ow,oh), Image.NEAREST)
-        return {'image': img,
-                'label': mask}
-    
-# random corp 321*321 
-class RandomCrop(object):
-    def __init__(self,  crop_size=321):
-        self.crop_size = crop_size
-
-    def __call__(self, sample):
-        img = sample['image']
-        mask = sample['label']
-        w, h = img.size
-        x1 = random.randint(0, w - self.crop_size)
-        y1 = random.randint(0, h - self.crop_size)
-        img = img.crop((x1, y1, x1 + self.crop_size, y1 + self.crop_size))
-        mask = mask.crop((x1, y1, x1 + self.crop_size, y1 + self.crop_size))
-        return {'image': img,
-                'label': mask}
-
-    
 if __name__ == '__main__':
-    from dataloaders.utils import decode_segmap
+    from dataloaders.dataloader_utils import decode_segmap
     from torch.utils.data import DataLoader
     import matplotlib.pyplot as plt
     import argparse
 
     parser = argparse.ArgumentParser()
     args = parser.parse_args()
+    args.resize = 513
     args.base_size = 513
     args.crop_size = 513
 
-    cityscapes_train = CityscapesSegmentation(args, split='train')
+    cityscapes_train = CityscapesSegmentation(args, split='retrain')
 
     dataloader = DataLoader(cityscapes_train, batch_size=2, shuffle=True, num_workers=2)
 
@@ -204,4 +152,3 @@ if __name__ == '__main__':
             break
 
     plt.show(block=True)
-
