@@ -441,14 +441,6 @@ class AutoDeeplab(nn.Module):
 
         [self.register_parameter(name, torch.nn.Parameter(param)) for name, param in zip(self._arch_param_names, self._arch_parameters)]
 
-    # def decode_viterbi(self):
-    #     decoder = Decoder(self.bottom_betas, self.betas8, self.betas16, self.top_betas)
-    #     return decoder.viterbi_decode()
-
-    # def decode_dfs(self):
-    #     decoder = Decoder(self.bottom_betas, self.betas8, self.betas16, self.top_betas)
-    #     return decoder.dfs_decode()
-
     def arch_parameters(self):
         # Get architecture parameters ["alphas", "betas"]
         return [param for name, param in self.named_parameters() if name in self._arch_param_names]
