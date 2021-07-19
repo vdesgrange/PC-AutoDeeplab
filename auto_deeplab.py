@@ -37,7 +37,7 @@ class AutoDeeplab(nn.Module):
             nn.ReLU()
         )
 
-        # intitial_fm = C_initial
+        # initial_fm = C_initial
         for i in range(self._num_layers):
 
             if i == 0:
@@ -159,13 +159,22 @@ class AutoDeeplab(nn.Module):
         self.level_4.append(self.stem2(temp))  # Spacial resolution reduction by factor 2. Downsample 4
 
         count = 0
+        k = sum(1 for i in range(self._steps) for n in range(i + 2))
         normalized_betas = torch.randn(self._num_layers, 4, 3).cuda()
-        # Softmax on alphas and betas
+        normalized_gammas = torch.zeros(k).cuda()
+
+        # Softmax on alphas (operations), gammas (intermediate nodes) and betas (autodeeplab network grid)
         if torch.cuda.device_count() > 1:
             print('1')
             img_device = torch.device('cuda', x.get_device())
             normalized_alphas = F.softmax(self.alphas.to(device=img_device), dim=-1)
 
+            # Softmax is applied over set of gammas corresponding to intermediate node inputs (2, 3, 4, 5)
+            offset = 0
+
+            for i in range(self._step):
+                normalized_gammas[offset:offset + i + 2] = F.softmax(self.gamma[offset:offset + i + 2].to(device=img_device), dim=-1)
+                offset += (i + 2)
             # normalized_betas[layer][ith node][0 : ➚, 1: ➙, 2 : ➘]
             for layer in range(len(self.betas)):
                 if layer == 0:
@@ -183,10 +192,20 @@ class AutoDeeplab(nn.Module):
                     normalized_betas[layer][0][1:] = F.softmax(self.betas[layer][0][1:].to(device=img_device), dim=-1) * (2/3)
                     normalized_betas[layer][1] = F.softmax(self.betas[layer][1].to(device=img_device), dim=-1)
                     normalized_betas[layer][2] = F.softmax(self.betas[layer][2].to(device=img_device), dim=-1)
-                    normalized_betas[layer][3][:2] = F.softmax(self.betas[layer][3][:1].to(device=img_device), dim=-1) * (2/3)
+                    normalized_betas[layer][3][:2] = F.softmax(self.betas[layer][3][:2].to(device=img_device), dim=-1) * (2/3)
         else:
+            # Set the values of each parameters
+
+            # Softmax is applied over the full set of alpha (all operations)
             normalized_alphas = F.softmax(self.alphas, dim=-1)
 
+            # Softmax is applied over set of gammas corresponding to intermediate node inputs (2, 3, 4, 5)
+            offset = 0
+            for i in range(self._step):
+                normalized_gammas[offset:offset + i + 2] = F.softmax(self.gamma[offset:offset + i + 2], dim=-1)
+                offset += (i + 2)
+
+            # Set betas
             for layer in range(len(self.betas)):
                 if layer == 0:
                     normalized_betas[layer][0][1:] = F.softmax(self.betas[layer][0][1:], dim=-1) * (2/3)
@@ -214,9 +233,9 @@ class AutoDeeplab(nn.Module):
                 # No cell l-2 for levels 4 and 8. Only level 4 usable for level 8.
                 # Can only use original layer 0 downsample by factor 4. L4-1.
                 # normalized_alphas refer to Alpha (cf. paper)
-                level4_new, = self.cells[count](None, None, self.level_4[-1], None, normalized_alphas)
+                level4_new, = self.cells[count](None, None, self.level_4[-1], None, normalized_alphas, normalized_gammas)
                 count += 1
-                level8_new, = self.cells[count](None, self.level_4[-1], None, None, normalized_alphas)
+                level8_new, = self.cells[count](None, self.level_4[-1], None, None, normalized_alphas, normalized_gammas)
                 count += 1
 
                 # Beta (cf. paper) from each node of previous layer, control outer network.
@@ -230,7 +249,8 @@ class AutoDeeplab(nn.Module):
                                                                None,
                                                                self.level_4[-1],
                                                                self.level_8[-1],
-                                                               normalized_alphas)
+                                                               normalized_alphas,
+                                                               normalized_gammas)
                 count += 1
                 # No downsample, from L4-2 and L8-1 cells
                 level4_new = normalized_betas[layer][0][1] * level4_new_1 + normalized_betas[layer][1][0] * level4_new_2
@@ -239,7 +259,8 @@ class AutoDeeplab(nn.Module):
                                                                self.level_4[-1],
                                                                self.level_8[-1],
                                                                None,
-                                                               normalized_alphas)
+                                                               normalized_alphas,
+                                                               normalized_gammas)
                 count += 1
                 level8_new = normalized_betas[layer][0][2] * level8_new_1 + normalized_betas[layer][1][2] * level8_new_2
 
@@ -248,7 +269,8 @@ class AutoDeeplab(nn.Module):
                                                  self.level_8[-1],
                                                  None,
                                                  None,
-                                                 normalized_alphas)
+                                                 normalized_alphas,
+                                                 normalized_gammas)
                 level16_new = normalized_betas[layer][1][2] * level16_new
                 count += 1
 
@@ -266,7 +288,8 @@ class AutoDeeplab(nn.Module):
                                                                None,
                                                                self.level_4[-1],
                                                                self.level_8[-1],
-                                                               normalized_alphas)
+                                                               normalized_alphas,
+                                                               normalized_gammas)
                 count += 1
                 level4_new = normalized_betas[layer][0][1] * level4_new_1 + normalized_betas[layer][1][0] * level4_new_2
 
@@ -274,7 +297,8 @@ class AutoDeeplab(nn.Module):
                                                                              self.level_4[-1],
                                                                              self.level_8[-1],
                                                                              self.level_16[-1],
-                                                                             normalized_alphas)
+                                                                             normalized_alphas,
+                                                                             normalized_gammas)
                 count += 1
                 level8_new = normalized_betas[layer][0][2] * level8_new_1 + normalized_betas[layer][1][1] * level8_new_2 + normalized_betas[layer][2][
                     0] * level8_new_3
@@ -283,7 +307,8 @@ class AutoDeeplab(nn.Module):
                                                                  self.level_8[-1],
                                                                  self.level_16[-1],
                                                                  None,
-                                                                 normalized_alphas)
+                                                                 normalized_alphas,
+                                                                 normalized_gammas)
                 count += 1
                 level16_new = normalized_betas[layer][1][2] * level16_new_1 + normalized_betas[layer][2][1] * level16_new_2
 
@@ -291,7 +316,9 @@ class AutoDeeplab(nn.Module):
                                                  self.level_16[-1],
                                                  None,
                                                  None,
-                                                 normalized_alphas)
+                                                 normalized_alphas,
+                                                 normalized_gammas)
+
                 level32_new = normalized_betas[layer][2][2] * level32_new
                 count += 1
 
@@ -310,7 +337,8 @@ class AutoDeeplab(nn.Module):
                                                                None,
                                                                self.level_4[-1],
                                                                self.level_8[-1],
-                                                               normalized_alphas)
+                                                               normalized_alphas,
+                                                               normalized_gammas)
                 count += 1
                 level4_new = normalized_betas[layer][0][1] * level4_new_1 + normalized_betas[layer][1][0] * level4_new_2
 
@@ -318,7 +346,8 @@ class AutoDeeplab(nn.Module):
                                                                              self.level_4[-1],
                                                                              self.level_8[-1],
                                                                              self.level_16[-1],
-                                                                             normalized_alphas)
+                                                                             normalized_alphas,
+                                                                             normalized_gammas)
                 count += 1
                 level8_new = normalized_betas[layer][0][2] * level8_new_1 + normalized_betas[layer][1][1] * level8_new_2 + normalized_betas[layer][2][
                     0] * level8_new_3
@@ -327,7 +356,8 @@ class AutoDeeplab(nn.Module):
                                                                                 self.level_8[-1],
                                                                                 self.level_16[-1],
                                                                                 self.level_32[-1],
-                                                                                normalized_alphas)
+                                                                                normalized_alphas,
+                                                                                normalized_gammas)
                 count += 1
                 level16_new = normalized_betas[layer][1][2] * level16_new_1 + normalized_betas[layer][2][1] * level16_new_2 + normalized_betas[layer][3][
                     0] * level16_new_3
@@ -336,7 +366,8 @@ class AutoDeeplab(nn.Module):
                                                                  self.level_16[-1],
                                                                  self.level_32[-1],
                                                                  None,
-                                                                 normalized_alphas)
+                                                                 normalized_alphas,
+                                                                 normalized_gammas)
                 count += 1
                 level32_new = normalized_betas[layer][2][2] * level32_new_1 + normalized_betas[layer][3][1] * level32_new_2
 
@@ -355,7 +386,8 @@ class AutoDeeplab(nn.Module):
                                                                None,
                                                                self.level_4[-1],
                                                                self.level_8[-1],
-                                                               normalized_alphas)
+                                                               normalized_alphas,
+                                                               normalized_gammas)
                 count += 1
                 level4_new = normalized_betas[layer][0][1] * level4_new_1 + normalized_betas[layer][1][0] * level4_new_2
 
@@ -363,7 +395,8 @@ class AutoDeeplab(nn.Module):
                                                                              self.level_4[-1],
                                                                              self.level_8[-1],
                                                                              self.level_16[-1],
-                                                                             normalized_alphas)
+                                                                             normalized_alphas,
+                                                                             normalized_gammas)
                 count += 1
 
                 level8_new = normalized_betas[layer][0][2] * level8_new_1 + normalized_betas[layer][1][1] * level8_new_2 + normalized_betas[layer][2][
@@ -373,7 +406,8 @@ class AutoDeeplab(nn.Module):
                                                                                 self.level_8[-1],
                                                                                 self.level_16[-1],
                                                                                 self.level_32[-1],
-                                                                                normalized_alphas)
+                                                                                normalized_alphas,
+                                                                                normalized_gammas)
                 count += 1
                 level16_new = normalized_betas[layer][1][2] * level16_new_1 + normalized_betas[layer][2][1] * level16_new_2 + normalized_betas[layer][3][
                     0] * level16_new_3
@@ -382,7 +416,8 @@ class AutoDeeplab(nn.Module):
                                                                  self.level_16[-1],
                                                                  self.level_32[-1],
                                                                  None,
-                                                                 normalized_alphas)
+                                                                 normalized_alphas,
+                                                                 normalized_gammas)
                 count += 1
                 level32_new = normalized_betas[layer][2][2] * level32_new_1 + normalized_betas[layer][3][1] * level32_new_2
 
@@ -422,21 +457,28 @@ class AutoDeeplab(nn.Module):
         Alpha and Beta are sampled from a standard gaussian (normal) distribution x 0.001
         """
         k = sum(1 for i in range(self._step) for n in range(2 + i))
+
         num_ops = len(PRIMITIVES)
 
         # Alpha and Beta are sampled from a standard gaussian (normal) distribution x 0.001
+        # num_input_for_nodes x num_operations
         alphas = (1e-3 * torch.randn(k, num_ops)).clone().detach().requires_grad_(True)
 
         # num_layer x num_spatial_levels x num_spatial_connections (up, straight, down)
         betas = (1e-3 * torch.randn(self._num_layers, 4, 3)).clone().detach().requires_grad_(True)
 
+        # num_input_for_nodes
+        gammas = (1e-3 * torch.randn(k)).clone().detach().requires_grad_(True)
+
         self._arch_parameters = [
             alphas,
             betas,
+            gammas,
         ]
         self._arch_param_names = [
             'alphas',
             'betas',
+            'gammas',
         ]
 
         [self.register_parameter(name, torch.nn.Parameter(param)) for name, param in zip(self._arch_param_names, self._arch_parameters)]

@@ -123,7 +123,15 @@ class Cell(nn.Module):
                     m.bias.data.zero_()
 
     def forward(self, s0, s1_down, s1_same, s1_up, n_alphas, n_gammas):
-
+        """
+        :param s0: ante-ante-cell
+        :param s1_down: previous cell coming from bottom level
+        :param s1_same: previous cell coming from same level
+        :param s1_up: previous cell coming from upper level
+        :param n_alphas: alpha weight (darts)
+        :param n_gammas: beta weight for edge normalization (pc-darts)
+        :return:
+        """
         if s1_down is not None:
             s1_down = self.prev_feature_resize(s1_down, 'down')
             s1_down = self.preprocess_down(s1_down)
@@ -168,6 +176,7 @@ class Cell(nn.Module):
                 all_states.append(states_up)
 
         final_concates = []
+        # Loop over edges coming to this node of the stem (reduction cell, increasing cell and normal cell)
         for states in all_states:
             offset = 0
 
