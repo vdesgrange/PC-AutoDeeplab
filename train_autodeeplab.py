@@ -189,7 +189,7 @@ class Trainer(object):
                 search = next(iter(self.train_loaderB))
                 image_search, target_search = search['image'], search['label']
                 if self.args.cuda:
-                    image_search, target_search = image_search.cuda (), target_search.cuda ()
+                    image_search, target_search = image_search.cuda(), target_search.cuda()
 
                 self.architect_optimizer.zero_grad()
                 output_search = self.model(image_search)

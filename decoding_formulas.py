@@ -5,16 +5,19 @@ import torch.nn.functional as F
 from retrain_model.new_model import network_layer_to_space
 
 class Decoder(object):
-    def __init__(self, alphas, betas, steps):
+    def __init__(self, alphas, betas, gammas, steps):
         self._betas = betas
         self._alphas = alphas
+        self._gammas = gammas
         self._steps = steps
+
         self._num_layers = self._betas.shape[0]
-        self.network_space = torch.zeros(12, 4, 3)
+        self.network_space = torch.zeros(self._num_layers, 4, 3)  # 12, 4, 3
 
         for layer in range(self._num_layers):
             if layer == 0:
                 self.network_space[layer][0][1:] = F.softmax(self._betas[layer][0][1:], dim=-1)  * (2/3)
+
             elif layer == 1:
                 self.network_space[layer][0][1:] = F.softmax(self._betas[layer][0][1:], dim=-1) * (2/3)
                 self.network_space[layer][1] = F.softmax(self._betas[layer][1], dim=-1)
@@ -23,7 +26,6 @@ class Decoder(object):
                 self.network_space[layer][0][1:] = F.softmax(self._betas[layer][0][1:], dim=-1) * (2/3)
                 self.network_space[layer][1] = F.softmax(self._betas[layer][1], dim=-1)            
                 self.network_space[layer][2] = F.softmax(self._betas[layer][2], dim=-1)
-
 
             else:
                 self.network_space[layer][0][1:] = F.softmax(self._betas[layer][0][1:], dim=-1) * (2/3)
@@ -262,22 +264,41 @@ class Decoder(object):
 
     def genotype_decode(self):
 
-        def _parse(alphas, steps):
+        def _parse(alphas, gammas, steps):
             gene = []
             start = 0
             n = 2
+
+            # Get the best operations
             for i in range(steps):
                 end = start + n
-                edges = sorted(range(start, end), key=lambda x: -np.max(alphas[x, 1:]))  # ignore none value
+
+                # pc-darts - multiply alpha (operation) by gamma (intermediate node)
+                a = alphas[start:end].copy()
+                g = gammas[start:end].copy()
+
+                for j in range(n):
+                    a[j,:] = a[j,:] * g[j]
+
+                edges = sorted(range(start, end), key=lambda x: -np.max(a[x, 1:]))  # ignore none value
                 top2edges = edges[:2]
                 for j in top2edges:
-                    best_op_index = np.argmax(alphas[j])  # this can include none op
+                    best_op_index = np.argmax(a[j])  # this can include none op
                     gene.append([j, best_op_index])
                 start = end
                 n += 1
+
             return np.array(gene)
 
+        k = sum(1 for i in range(self._steps) for n in range(i + 2))
         normalized_alphas = F.softmax(self._alphas, dim=-1).data.cpu().numpy()
-        gene_cell = _parse(normalized_alphas, self._steps)
+
+        offset = 0
+        normalized_gammas = torch.zeros(k)
+        for i in range(self._step):
+            normalized_gammas[offset:offset + i + 2] = F.softmax(self._gammas[offset:offset + i + 2], dim=-1).data.cpu().numpy()
+            offset += (i + 2)
+
+        gene_cell = _parse(normalized_alphas, normalized_gammas, self._steps)
 
         return gene_cell

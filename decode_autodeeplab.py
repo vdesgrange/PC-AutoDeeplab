@@ -20,11 +20,12 @@ class Loader(object):
         args.start_epoch = checkpoint['epoch']
         self._alphas = checkpoint['state_dict']['alphas']
         self._betas = checkpoint['state_dict']['betas']
+        self._gammas = checkpoint['state_dict']['gammas']
 
-        self.decoder = Decoder(alphas=self._alphas, betas=self._betas, steps=5)
+        self.decoder = Decoder(alphas=self._alphas, betas=self._betas, gammas=self._gammas, steps=5)
 
-    def retreive_alphas_betas(self):
-        return self._alphas, self._betas
+    def retrieve_alphas_betas_gammas(self):
+        return self._alphas, self._betas, self._gammas
 
     def decode_architecture(self):
         paths, paths_space = self.decoder.viterbi_decode()
