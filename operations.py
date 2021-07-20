@@ -222,14 +222,12 @@ class Identity(nn.Module):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
 
-class Zero(nn.Module):
 
+class Zero(nn.Module):
     def __init__(self, stride):
         super(Zero, self).__init__()
         self.stride = stride
         self._initialize_weights()
-
-
 
     def forward(self, x):
         if self.stride == 1:
@@ -246,7 +244,6 @@ class Zero(nn.Module):
                 if m.weight is not None:
                     m.weight.data.fill_(1)
                     m.bias.data.zero_()
-
 
 
 class FactorizedReduce(nn.Module):

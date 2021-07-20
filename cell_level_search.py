@@ -33,7 +33,7 @@ class MixedOp(nn.Module):
 
     def forward(self, x, weights):
         # channel proportion k=4
-        if x is not None:
+        if x is not (None or 0):
             C_dim = x.shape[1]
             xtemp_a = x[:, :C_dim//self.k, :, :]  # Selected channels
             xtemp_b = x[:, C_dim//self.k:, :, :]  # Remaining channels
@@ -168,15 +168,15 @@ class Cell(nn.Module):
                 all_states.append(states_up)
         else:
             if s1_down is not None:
-                states_down = [0, s1_down]
+                states_down = [s1_down]  # [0, s1_down] No empty state, check it doesn't impact with index starting at 2
                 all_states.append(states_down)
 
             if s1_same is not None:
-                states_same = [0, s1_same]
+                states_same = [s1_same]  # [0, s1_same] No empty state, check it doesn't impact with index starting at 2
                 all_states.append(states_same)
 
             if s1_up is not None:
-                states_up = [0, s1_up]
+                states_up = [s1_up]  # [0, s1_up] No empty state, check it doesn't impact with index starting at 2
                 all_states.append(states_up)
 
         final_concates = []
