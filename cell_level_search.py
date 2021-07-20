@@ -33,21 +33,25 @@ class MixedOp(nn.Module):
 
     def forward(self, x, weights):
         # channel proportion k=4
-        C_dim = x.shape[1]
-        xtemp_a = x[:, :C_dim//self.k, :, :]  # Selected channels
-        xtemp_b = x[:, C_dim//self.k:, :, :]  # Remaining channels
+        if x is not None:
+            C_dim = x.shape[1]
+            xtemp_a = x[:, :C_dim//self.k, :, :]  # Selected channels
+            xtemp_b = x[:, C_dim//self.k:, :, :]  # Remaining channels
 
-        # 1 - Apply operation to selected channels
-        xtemp_c = sum(w * op(xtemp_a) for w, op in zip(weights, self._ops))
+            # 1 - Apply operation to selected channels
+            xtemp_c = sum(w * op(xtemp_a) for w, op in zip(weights, self._ops))
 
-        # 2 - Add the other channels
-        # reduction cell needs pooling before concat
-        if xtemp_c.shape[2] == x.shape[2]:
-            ans = torch.cat([xtemp_c, xtemp_b], dim=1)
+            # 2 - Add the other channels
+            # reduction cell needs pooling before concat
+            if xtemp_c.shape[2] == x.shape[2]:
+                ans = torch.cat([xtemp_c, xtemp_b], dim=1)
+            else:
+                ans = torch.cat([xtemp_c, self.mp(xtemp_b)], dim=1)
+
+            ans = channel_shuffle(ans, self.k)
+
         else:
-            ans = torch.cat([xtemp_c, self.mp(xtemp_b)], dim=1)
-
-        ans = channel_shuffle(ans, self.k)
+            ans = sum(w * op(x) for w, op in zip(weights, self._ops))
         # ans = torch.cat([ans[ : ,  dim_2//4:, :, :],ans[ : , :  dim_2//4, :, :]],dim=1)
         # except channel shuffle, channel shift also works
         return ans

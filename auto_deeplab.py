@@ -17,7 +17,7 @@ class AutoDeeplab(nn.Module):
         self._block_multiplier = block_multiplier
         self._filter_multiplier = filter_multiplier
         self._criterion = criterion
-        self._initialize_alphas_betas()
+        self._initialize_alphas_betas_gammas()
         f_initial = int(self._filter_multiplier)
         half_f_initial = int(f_initial / 2)
 
@@ -159,7 +159,7 @@ class AutoDeeplab(nn.Module):
         self.level_4.append(self.stem2(temp))  # Spacial resolution reduction by factor 2. Downsample 4
 
         count = 0
-        k = sum(1 for i in range(self._steps) for n in range(i + 2))
+        k = sum(1 for i in range(self._step) for n in range(i + 2))
         normalized_betas = torch.randn(self._num_layers, 4, 3).cuda()
         normalized_gammas = torch.zeros(k).cuda()
 
@@ -173,7 +173,7 @@ class AutoDeeplab(nn.Module):
             offset = 0
 
             for i in range(self._step):
-                normalized_gammas[offset:offset + i + 2] = F.softmax(self.gamma[offset:offset + i + 2].to(device=img_device), dim=-1)
+                normalized_gammas[offset:offset + i + 2] = F.softmax(self.gammas[offset:offset + i + 2].to(device=img_device), dim=-1)
                 offset += (i + 2)
             # normalized_betas[layer][ith node][0 : ➚, 1: ➙, 2 : ➘]
             for layer in range(len(self.betas)):
@@ -202,7 +202,7 @@ class AutoDeeplab(nn.Module):
             # Softmax is applied over set of gammas corresponding to intermediate node inputs (2, 3, 4, 5)
             offset = 0
             for i in range(self._step):
-                normalized_gammas[offset:offset + i + 2] = F.softmax(self.gamma[offset:offset + i + 2], dim=-1)
+                normalized_gammas[offset:offset + i + 2] = F.softmax(self.gammas[offset:offset + i + 2], dim=-1)
                 offset += (i + 2)
 
             # Set betas
@@ -451,7 +451,7 @@ class AutoDeeplab(nn.Module):
 
         return sum_feature_map
 
-    def _initialize_alphas_betas(self):
+    def _initialize_alphas_betas_gammas(self):
         """
         Initial scalar Alpha and Beta which controls the outer network level.
         Alpha and Beta are sampled from a standard gaussian (normal) distribution x 0.001
