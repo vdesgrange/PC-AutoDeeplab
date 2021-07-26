@@ -280,7 +280,8 @@ class Decoder(object):
                 for j in range(n):
                     a[j,:] = a[j,:] * g[j]
 
-                edges = sorted(range(start, end), key=lambda x: -np.max(a[x, 1:]))  # ignore none value
+                edges = sorted(range(i + 2), key=lambda x: -np.max(a[x, 1:]))
+                # edges = sorted(range(start, end), key=lambda x: -np.max(a[x, 1:]))  # ignore none value
                 top2edges = edges[:2]
                 for j in top2edges:
                     best_op_index = np.argmax(a[j])  # this can include none op
@@ -294,8 +295,8 @@ class Decoder(object):
         normalized_alphas = F.softmax(self._alphas, dim=-1).data.cpu().numpy()
 
         offset = 0
-        normalized_gammas = torch.zeros(k)
-        for i in range(self._step):
+        normalized_gammas = np.zeros(k)
+        for i in range(self._steps):
             normalized_gammas[offset:offset + i + 2] = F.softmax(self._gammas[offset:offset + i + 2], dim=-1).data.cpu().numpy()
             offset += (i + 2)
 
