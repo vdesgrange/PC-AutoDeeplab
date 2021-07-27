@@ -45,8 +45,9 @@ def get_new_network_cell():
     network_path_space = result_paths_space
     genotype = load_model.decode_cell()
 
-    print('architecture search results:', network_path)
-    print('new cell structure:', genotype)
+    print('network path:', network_path)
+    print('genotype:', genotype)
+    print('network path space:', network_path_space)
 
     dir_name = os.path.dirname(args.resume)
     network_path_filename = os.path.join(dir_name, 'network_path')
