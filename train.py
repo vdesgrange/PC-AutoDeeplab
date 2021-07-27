@@ -2,7 +2,7 @@ import os
 import pdb
 import warnings
 import numpy as np
-
+import time
 import torch
 import torch.nn as nn
 import torch.utils.data
@@ -69,7 +69,14 @@ def main():
         else:
             raise ValueError('=> no checkpoint found at {0}'.format(args.resume))
 
+    start = time.time()
+    print('Starting Epoch:', start_epoch)
+    print('Starting time:', time.ctime(start))
+    print('Total Epoches:', args.epochs)
+
     for epoch in range(start_epoch, args.epochs):
+        print('Epoch {} train. start time: {}'.format(epoch + 1, time.ctime()))
+
         losses = AverageMeter()
         for i, sample in enumerate(dataset_loader):
             cur_iter = epoch * len(dataset_loader) + i
@@ -88,8 +95,8 @@ def main():
 
             print('epoch: {0}\t''iter: {1}/{2}\t''lr: {3:.6f}\t''loss: {loss.val:.4f} ({loss.ema:.4f})'.format(
                 epoch + 1, i + 1, len(dataset_loader), scheduler.get_lr(optimizer), loss=losses))
-        if epoch < args.epochs - 50:
-            if epoch % 50 == 0:
+        if epoch < args.epochs - 10:
+            if epoch % 10 == 0:
                 torch.save({
                     'epoch': epoch + 1,
                     'state_dict': model.state_dict(),
@@ -102,6 +109,8 @@ def main():
                 'optimizer': optimizer.state_dict(),
             }, model_fname % (epoch + 1))
 
+        print('Ending time: ', time.ctime())
+        print('Running time: ', time.time() - start)
         print('reset local total loss!')
 
 if __name__ == "__main__":
